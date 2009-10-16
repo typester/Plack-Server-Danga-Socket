@@ -81,6 +81,7 @@ sub register_service {
             'psgi.errors'       => *STDERR,
             'psgi.url_scheme'   => 'http',
             'psgi.nonblocking'  => Plack::Util::TRUE,
+            'psgi.streaming'    => Plack::Util::TRUE,
             'psgi.run_once'     => Plack::Util::FALSE,
             'psgi.multithread'  => Plack::Util::FALSE,
             'psgi.multiprocess' => Plack::Util::FALSE,
@@ -197,14 +198,26 @@ sub _response_handler {
 
     my $res = Plack::Util::run_app $app, $env;
 
+    if (ref $res eq 'ARRAY') {
+        $self->_write_response($socket, $res);
+    } elsif (ref $res eq 'CODE') {
+        $res->(sub { $self->_write_response($socket, shift) });
+    } else {
+        $res = [ 500, ['Content-Type' => 'text/plain'], [ "Unknown response type $res" ] ];
+        $self->_write_response($socket, $res);
+    }
+}
+
+sub _write_response {
+    my($self, $socket, $res) = @_;
+
     $self->_write_headers($socket, $res->[0], $res->[1]);
 
     my $body = $res->[2];
     my $disconnect_cb = sub {
         if ($socket->write) {
             $socket->close;
-        }
-        else {
+        } else {
             $socket->watch_write(1);
             $socket->{on_write_ready} = sub {
                 my ($socket) = @_;
@@ -213,7 +226,12 @@ sub _response_handler {
         }
     };
 
-    if ($HasAIO && Plack::Util::is_real_fh($body)) {
+    if (!defined $body) {
+        return Plack::Util::inline_object
+            write => sub { $socket->write(@_) },
+            close => $disconnect_cb;
+    }
+    elsif ($HasAIO && Plack::Util::is_real_fh($body)) {
         my $offset = 0;
         my $length = -s $body;
         $socket->{sock}->blocking(1);
